@@ -171,3 +171,20 @@ input:focus, select:focus { outline: 2px solid rgba(37, 99, 235, .25); border-co
 .toast.err { background: #991b1b; }
 .toast.info { background: #1e40af; }
 @keyframes slidein { from { transform: translateY(8px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+/* ---------- 巡检版只读视图 ---------- */
+#view-inspect { display: flex; gap: 0; padding: 0; height: calc(100vh - 46px); }
+.muted.sub { font-size: 12px; font-weight: 400; }
+.inspect-empty {
+  position: absolute; inset: 0; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; text-align: center;
+  background: rgba(233, 235, 239, .92); line-height: 1.8;
+}
+.inspect-empty-title { font-size: 18px; font-weight: 600; margin: 0; }
+.inspect-detail {
+  margin-top: 10px; padding: 10px 12px; border: 1px solid var(--border);
+  border-radius: 8px; background: #f8fafc; font-size: 12px; line-height: 1.7;
+}
+.inspect-detail h4 { margin: 0 0 6px; font-size: 13px; }
+.inspect-detail .verts { color: var(--muted); word-break: break-all; }
+.polygon-region.inspect-selected { stroke-width: 4; }

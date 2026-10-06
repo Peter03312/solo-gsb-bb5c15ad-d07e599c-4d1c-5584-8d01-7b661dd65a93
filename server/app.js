@@ -686,6 +686,200 @@ app.post('/api/import/file', uploader(importUpload, 'file'), wrap((req, res) => 
   });
 }));
 
+/* --------------------------- 巡检版发布 / 查询 --------------------------- */
+/*
+ * 巡检版是发布时刻的只读整体快照：原图独立拷贝 + 全部未删除区域的
+ * 编号 / 风险等级 / 原图坐标整体冻结。发布不修改 plans/regions，
+ * 因此后续编辑、删区、同尺寸换图都不会改变已发布内容。
+ */
+
+function publicationJson(row, maxSeq) {
+  return {
+    id: row.id,
+    plan_id: row.plan_id,
+    seq: row.seq,
+    plan_version: row.plan_version,
+    name: row.name,
+    width: row.width,
+    height: row.height,
+    image_mime: row.image_mime,
+    region_count: row.region_count,
+    created_at: row.created_at,
+    latest: row.seq === maxSeq,
+  };
+}
+
+function publicationRegions(pubId) {
+  return db.prepare(
+    'SELECT * FROM publication_regions WHERE publication_id = ? ORDER BY id'
+  ).all(pubId).map((r) => ({
+    code: r.code,
+    risk_level: r.risk_level,
+    vertices: JSON.parse(r.vertices),
+    region_id: r.region_id,
+    region_version: r.region_version,
+  }));
+}
+
+function latestSeq(planId) {
+  return db.prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM publications WHERE plan_id = ?')
+    .get(planId).m;
+}
+
+/** 按发布序号（或 latest）取巡检版；未发布 / 序号不存在时给出明确中文提示 */
+function findPublication(planId, seqParam) {
+  const max = latestSeq(planId);
+  if (seqParam === 'latest') {
+    if (max === 0) {
+      throw new ApiError(404, 'NO_PUBLICATION', '该平面图暂无巡检版（尚未发布）');
+    }
+    return db.prepare('SELECT * FROM publications WHERE plan_id = ? AND seq = ?')
+      .get(planId, max);
+  }
+  const seq = Number(seqParam);
+  if (!Number.isInteger(seq) || seq < 1) {
+    throw new ApiError(400, 'VALIDATION_ERROR', '发布序号必须为正整数，或使用 latest 表示最新版');
+  }
+  const row = db.prepare('SELECT * FROM publications WHERE plan_id = ? AND seq = ?')
+    .get(planId, seq);
+  if (!row) {
+    if (max === 0) {
+      throw new ApiError(404, 'NO_PUBLICATION', '该平面图暂无巡检版（尚未发布）');
+    }
+    throw new ApiError(404, 'NOT_FOUND',
+      `巡检版 #${seq} 不存在：该平面图当前共发布 ${max} 版（序号 1–${max}）`);
+  }
+  return row;
+}
+
+/**
+ * 发布巡检版。请求必须携带所见图纸版本 plan_version：
+ *  - 期间有改动 → 409 PLAN_VERSION_CONFLICT，且不留任何部分快照；
+ *  - 同一图纸版本重复发布 → 200 返回已有巡检版（幂等，不产生重复）；
+ *  - 原图缺失或快照保存失败 → 不记为发布成功。
+ */
+app.post('/api/plans/:id/publish', wrap((req, res) => {
+  const plan = getPlanOr404(req.params.id);
+  if (req.body.plan_version == null) {
+    throw new ApiError(400, 'VALIDATION_ERROR',
+      '发布请求必须携带所见图纸版本 plan_version（正整数）');
+  }
+  const pv = Number(req.body.plan_version);
+  if (!Number.isInteger(pv) || pv < 1) {
+    throw new ApiError(400, 'VALIDATION_ERROR', 'plan_version 必须为正整数');
+  }
+  if (pv !== plan.version) {
+    throw new ApiError(409, 'PLAN_VERSION_CONFLICT',
+      `平面图在你查看后已被修改（你的基准版本 v${pv}，当前版本 v${plan.version}）。` +
+      `为避免发布过期内容，本次发布已取消且未留下任何快照；请刷新后重新发布。`,
+      { server: serverSnapshot(plan) });
+  }
+
+  // 幂等：同一图纸版本已发布过，直接返回既有巡检版，不产生重复
+  const dup = db.prepare(
+    'SELECT * FROM publications WHERE plan_id = ? AND plan_version = ?'
+  ).get(plan.id, pv);
+  if (dup) {
+    return res.status(200).json({
+      duplicate: true,
+      message: `图纸版本 v${pv} 已发布为巡检版 #${dup.seq}，未重复创建`,
+      publication: publicationJson(dup, latestSeq(plan.id)),
+      regions: publicationRegions(dup.id),
+    });
+  }
+
+  // 原图缺失不得记为发布成功
+  const srcFile = path.join(config.uploadDir(), plan.image_file || '');
+  if (!plan.image_file || !fs.existsSync(srcFile)) {
+    throw new ApiError(410, 'IMAGE_MISSING',
+      '原图文件在数据目录中缺失，无法发布巡检版；未产生任何发布记录');
+  }
+
+  const regions = activeRegions(plan.id);
+  const imageBuf = fs.readFileSync(srcFile);
+  let pubId = null;
+  let snapshotName = null;
+  try {
+    // 单事务落库：任一步失败整体回滚，不留下部分快照。
+    // （better-sqlite3 同步执行，事务外读取与事务提交之间不会有其他请求交错；
+    //   唯一索引 idx_publications_plan_version 兜底防重。）
+    db.transaction(() => {
+      const seq = latestSeq(plan.id) + 1;
+      const info = db.prepare(`
+        INSERT INTO publications
+          (plan_id, seq, plan_version, name, width, height, image_mime, image_file, region_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, '', ?)
+      `).run(plan.id, seq, plan.version, plan.name, plan.width, plan.height,
+             plan.image_mime, regions.length);
+      pubId = info.lastInsertRowid;
+      // 快照原图独立拷贝：先写临时文件再原子改名；写盘失败则整个事务回滚
+      snapshotName = storeImageFile(`pub-${pubId}`, imageBuf, plan.image_mime);
+      db.prepare('UPDATE publications SET image_file = ? WHERE id = ?')
+        .run(snapshotName, pubId);
+      const stmt = db.prepare(`
+        INSERT INTO publication_regions
+          (publication_id, region_id, code, risk_level, vertices, region_version)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `);
+      for (const r of regions) {
+        stmt.run(pubId, r.id, r.code, r.risk_level, JSON.stringify(r.vertices), r.version);
+      }
+    })();
+  } catch (e) {
+    // 保存失败不得记为发布成功：事务已回滚，清理可能残留的快照文件
+    if (snapshotName) {
+      const f = path.join(config.uploadDir(), snapshotName);
+      if (fs.existsSync(f)) { try { fs.unlinkSync(f); } catch (_) {} }
+    }
+    throw e;
+  }
+
+  const pub = db.prepare('SELECT * FROM publications WHERE id = ?').get(pubId);
+  res.status(201).json({
+    duplicate: false,
+    publication: publicationJson(pub, pub.seq),
+    regions: publicationRegions(pubId),
+  });
+}));
+
+// 巡检版列表（按发布序号升序；空数组即表示暂无巡检版）
+app.get('/api/plans/:id/publications', wrap((req, res) => {
+  const plan = getPlanOr404(req.params.id);
+  const rows = db.prepare(
+    'SELECT * FROM publications WHERE plan_id = ? ORDER BY seq'
+  ).all(plan.id);
+  const max = latestSeq(plan.id);
+  res.json({
+    plan_id: plan.id,
+    publications: rows.map((r) => publicationJson(r, max)),
+  });
+}));
+
+// 查看某一巡检版（只读）：:seq 为发布序号，或 latest 表示最新版
+app.get('/api/plans/:id/publications/:seq', wrap((req, res) => {
+  const plan = getPlanOr404(req.params.id);
+  const pub = findPublication(plan.id, req.params.seq);
+  res.json({
+    publication: publicationJson(pub, latestSeq(plan.id)),
+    regions: publicationRegions(pub.id),
+  });
+}));
+
+// 巡检版快照原图（发布时刻的独立拷贝，不受后续换图影响）
+app.get('/api/plans/:id/publications/:seq/image', wrap((req, res) => {
+  const plan = getPlanOr404(req.params.id);
+  const pub = findPublication(plan.id, req.params.seq);
+  const file = path.join(config.uploadDir(), pub.image_file || '');
+  if (!pub.image_file || !fs.existsSync(file)) {
+    throw new ApiError(410, 'IMAGE_MISSING', `巡检版 #${pub.seq} 的快照原图在数据目录中缺失`);
+  }
+  res.setHeader('Cache-Control', 'private, max-age=3600');
+  res.setHeader('Content-Type', pub.image_mime);
+  fs.createReadStream(file).on('error', () => {
+    if (!res.headersSent) res.status(500).json({ error: 'INTERNAL', message: '读取图片失败' });
+  }).pipe(res);
+}));
+
 /* ------------------------------- 错误处理 ------------------------------- */
 
 app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
@@ -711,3 +905,6 @@ process.on('SIGTERM', () => server.close(() => db.close()));
 process.on('SIGINT', () => server.close(() => db.close()));
 
 module.exports = app;
+// 供集成测试优雅关闭使用；不改变 app 本身作为 Express 应用的导出约定
+module.exports.server = server;
+module.exports.db = db;

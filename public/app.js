@@ -22,6 +22,15 @@ const state = {
   pollTimer: null,
 };
 
+/* 巡检版只读视图的独立状态（与编辑画布互不影响） */
+const inspect = {
+  pubs: [],               // 发布列表（摘要）
+  current: null,          // 当前查看的 {publication, regions}
+  selected: null,         // 列表中选中的区域 code（仅高亮展示）
+  transform: { scale: 1, tx: 0, ty: 0 },
+  drag: null,
+};
+
 /* ------------------------------- 工具 ------------------------------- */
 
 async function api(method, url, body) {
@@ -72,6 +81,7 @@ function centroid(verts) {
 function showView(name) {
   $('view-list').classList.toggle('hidden', name !== 'list');
   $('view-editor').classList.toggle('hidden', name !== 'editor');
+  $('view-inspect').classList.toggle('hidden', name !== 'inspect');
 }
 
 async function loadPlans() {
@@ -182,6 +192,7 @@ async function openPlan(id) {
   renderDraft();
   updateForm();
   fitView();
+  refreshPublishStatus();
   startPolling();
 }
 
@@ -838,6 +849,7 @@ function startPolling() {
           setTimeout(() => badge.classList.add('hidden'), 4000);
         }
       }
+      refreshPublishStatus();
     } catch (_) { /* 轮询失败静默，下轮重试 */ }
     first = false;
   }, 3000);
@@ -846,6 +858,316 @@ function stopPolling() {
   if (state.pollTimer) clearInterval(state.pollTimer);
   state.pollTimer = null;
 }
+
+/* -------------------------- 巡检版：发布与只读查看 -------------------------- */
+
+/** 刷新编辑器面板中的发布状态摘要，并同步巡检视图的序号选择器 */
+async function refreshPublishStatus() {
+  if (!state.plan) return;
+  try {
+    const data = await api('GET', `/api/plans/${state.plan.id}/publications`);
+    inspect.pubs = data.publications;
+    const el = $('pubStatus');
+    if (!inspect.pubs.length) {
+      el.textContent = '暂无巡检版：当前图纸尚未发布。';
+    } else {
+      const latest = inspect.pubs[inspect.pubs.length - 1];
+      el.textContent = `最新巡检版 #${latest.seq}（基于图纸 v${latest.plan_version} · ` +
+        `${latest.region_count} 个区域 · ${latest.created_at}）`;
+    }
+    renderInspectSeqOptions();
+  } catch (_) { /* 状态刷新失败静默，下轮重试 */ }
+}
+
+function renderInspectSeqOptions() {
+  const sel = $('inspectSeq');
+  if (!sel) return;
+  const keep = inspect.current ? String(inspect.current.publication.seq) : sel.value;
+  sel.innerHTML = '';
+  for (const p of inspect.pubs) {
+    const opt = document.createElement('option');
+    opt.value = String(p.seq);
+    opt.textContent = `巡检版 #${p.seq}（基于图纸 v${p.plan_version}）${p.latest ? ' · 最新' : ''}`;
+    sel.appendChild(opt);
+  }
+  if (keep && inspect.pubs.some((p) => String(p.seq) === keep)) sel.value = keep;
+}
+
+$('btnPublish').addEventListener('click', async () => {
+  if (!state.plan) return;
+  if (state.draft) {
+    return toast('有未保存的编辑：请先保存或取消，再以最新图纸版本发布', 'err', 5000);
+  }
+  const btn = $('btnPublish');
+  btn.disabled = true;
+  try {
+    const res = await api('POST', `/api/plans/${state.plan.id}/publish`, {
+      plan_version: state.plan.version,
+    });
+    if (res.duplicate) {
+      toast(`图纸版本 v${state.plan.version} 已发布过（巡检版 #${res.publication.seq}），未重复创建`,
+        'info', 5000);
+    } else {
+      toast(`已发布巡检版 #${res.publication.seq}（基于图纸 v${res.publication.plan_version} · ` +
+        `${res.publication.region_count} 个区域）`, 'ok', 5000);
+    }
+    await refreshPublishStatus();
+  } catch (err) {
+    if (err.status === 409 && err.data && err.data.server) {
+      // 发布期间图纸被改动：未产生任何快照，应用最新状态后由用户重新发布
+      const snap = err.data.server;
+      if (snap.plan_version) state.plan.version = snap.plan_version;
+      if (Array.isArray(snap.regions)) state.regions = snap.regions;
+      updatePlanVersionBadge();
+      renderRegions();
+      renderRegionList();
+    }
+    toast((err.status === 409 ? '发布取消：' : '发布失败：') + err.message, 'err', 8000);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+$('btnViewInspect').addEventListener('click', () => openInspectView());
+$('btnInspectBack').addEventListener('click', () => {
+  showView('editor');
+});
+
+async function openInspectView() {
+  if (!state.plan) return;
+  showView('inspect');
+  await refreshPublishStatus();
+  if (!inspect.pubs.length) {
+    inspect.current = null;
+    renderInspectEmpty();
+    return;
+  }
+  // 默认打开最新版；若之前看过某版且仍存在则保持
+  const keep = inspect.current &&
+    inspect.pubs.find((p) => p.seq === inspect.current.publication.seq);
+  await loadInspection(keep ? keep.seq : 'latest');
+}
+
+function renderInspectEmpty() {
+  $('inspectEmpty').classList.remove('hidden');
+  $('inspectSeqBadge').textContent = '暂无巡检版';
+  $('inspectPlanVer').textContent = '';
+  $('inspectLatestBadge').classList.add('hidden');
+  $('inspectMeta').textContent = '发布后可在此按序号查看只读快照。';
+  $('inspectRegionCount').textContent = '';
+  $('inspectRegionList').innerHTML = '';
+  $('inspectRegionDetail').classList.add('hidden');
+  $('inspectLayer').innerHTML = '';
+  $('inspectImage').removeAttribute('href');
+  renderInspectSeqOptions();
+}
+
+async function loadInspection(seq) {
+  try {
+    const data = await api('GET', `/api/plans/${state.plan.id}/publications/${seq}`);
+    inspect.current = data;
+    inspect.selected = null;
+    renderInspection();
+  } catch (err) {
+    if (err.code === 'NO_PUBLICATION') {
+      inspect.current = null;
+      renderInspectEmpty();
+    } else {
+      toast(err.message, 'err', 6000);
+    }
+  }
+}
+
+function renderInspection() {
+  const { publication: pub, regions } = inspect.current;
+  $('inspectEmpty').classList.add('hidden');
+  $('inspectSeqBadge').textContent = `巡检版 #${pub.seq}`;
+  $('inspectPlanVer').textContent = `基于图纸 v${pub.plan_version}`;
+  $('inspectLatestBadge').classList.toggle('hidden', !pub.latest);
+  $('inspectMeta').textContent =
+    `发布于 ${pub.created_at} · ${pub.width}×${pub.height}px · ${regions.length} 个区域`;
+
+  const img = $('inspectImage');
+  const url = `/api/plans/${state.plan.id}/publications/${pub.seq}/image`;
+  img.setAttribute('href', url);
+  img.setAttributeNS('http://www.w3.org/1999/xlink', 'xlink:href', url);
+  img.setAttribute('width', pub.width);
+  img.setAttribute('height', pub.height);
+  $('inspectBg').setAttribute('width', pub.width);
+  $('inspectBg').setAttribute('height', pub.height);
+
+  renderInspectSeqOptions();
+  $('inspectSeq').value = String(pub.seq);
+  renderInspectRegions();
+  renderInspectList();
+  inspectFit();
+}
+
+function renderInspectRegions() {
+  const layer = $('inspectLayer');
+  layer.innerHTML = '';
+  const { regions } = inspect.current;
+  for (const r of regions) {
+    const c = RISK_COLORS[r.risk_level] || { fill: 'rgba(107,114,128,.15)', stroke: '#6b7280' };
+    const poly = document.createElementNS(SVGNS, 'polygon');
+    poly.setAttribute('points', pointsStr(r.vertices));
+    poly.setAttribute('fill', c.fill);
+    poly.setAttribute('stroke', c.stroke);
+    poly.setAttribute('class',
+      'polygon-region' + (inspect.selected === r.code ? ' inspect-selected' : ''));
+    poly.dataset.code = r.code;
+    poly.addEventListener('click', () => selectInspectRegion(r.code));
+    layer.appendChild(poly);
+
+    const ctr = centroid(r.vertices);
+    const label = document.createElementNS(SVGNS, 'text');
+    label.setAttribute('x', ctr.x);
+    label.setAttribute('y', ctr.y);
+    label.setAttribute('text-anchor', 'middle');
+    label.setAttribute('dominant-baseline', 'central');
+    label.setAttribute('class', 'poly-label');
+    label.textContent = `${r.code} · ${r.risk_level}`;
+    layer.appendChild(label);
+  }
+}
+
+function renderInspectList() {
+  const { regions } = inspect.current;
+  $('inspectRegionCount').textContent = `（${regions.length}）`;
+  const ul = $('inspectRegionList');
+  ul.innerHTML = '';
+  for (const r of regions) {
+    const li = document.createElement('li');
+    if (inspect.selected === r.code) li.classList.add('active');
+    li.innerHTML = `
+      <span class="risk-dot ${esc(r.risk_level)}"></span>
+      <span class="r-code">${esc(r.code)}</span>
+      <span class="muted">${esc(r.risk_level)}</span>`;
+    li.onclick = () => selectInspectRegion(r.code);
+    ul.appendChild(li);
+  }
+  renderInspectDetail();
+}
+
+function selectInspectRegion(code) {
+  inspect.selected = inspect.selected === code ? null : code;
+  renderInspectRegions();
+  renderInspectList();
+}
+
+function renderInspectDetail() {
+  const box = $('inspectRegionDetail');
+  const r = inspect.current &&
+    inspect.current.regions.find((x) => x.code === inspect.selected);
+  if (!r) {
+    box.classList.add('hidden');
+    box.innerHTML = '';
+    return;
+  }
+  const verts = r.vertices.map((p) => `(${p.x}, ${p.y})`).join(' ');
+  box.innerHTML = `
+    <h4>${esc(r.code)} · ${esc(r.risk_level)}</h4>
+    <div class="verts">原图坐标：${esc(verts)}</div>`;
+  box.classList.remove('hidden');
+}
+
+$('inspectSeq').addEventListener('change', (e) => loadInspection(e.target.value));
+$('btnInspectLatest').addEventListener('click', () => loadInspection('latest'));
+
+/* ----------------------- 巡检视图：缩放 / 平移（只读） ----------------------- */
+
+const inspectSvg = $('inspectSvg');
+
+function applyInspectTransform() {
+  const t = inspect.transform;
+  $('inspectViewport').setAttribute('transform',
+    `translate(${t.tx} ${t.ty}) scale(${t.scale})`);
+  $('inspectZoom').textContent = `缩放 ${Math.round(t.scale * 100)}%`;
+}
+
+function inspectZoomAt(clientX, clientY, factor) {
+  const rect = inspectSvg.getBoundingClientRect();
+  const mx = clientX - rect.left;
+  const my = clientY - rect.top;
+  const t = inspect.transform;
+  const ns = Math.min(20, Math.max(0.05, t.scale * factor));
+  const f = ns / t.scale;
+  t.tx = mx - (mx - t.tx) * f;
+  t.ty = my - (my - t.ty) * f;
+  t.scale = ns;
+  applyInspectTransform();
+}
+
+function inspectFit() {
+  if (!inspect.current) return;
+  const pub = inspect.current.publication;
+  const rect = inspectSvg.getBoundingClientRect();
+  const pad = 40;
+  const s = Math.min(
+    (rect.width - pad * 2) / pub.width,
+    (rect.height - pad * 2) / pub.height
+  );
+  inspect.transform.scale = Math.min(8, Math.max(0.05, s));
+  inspect.transform.tx = (rect.width - pub.width * inspect.transform.scale) / 2;
+  inspect.transform.ty = (rect.height - pub.height * inspect.transform.scale) / 2;
+  applyInspectTransform();
+}
+
+$('btnInspectZoomIn').onclick = () => inspectZoomCenter(1.25);
+$('btnInspectZoomOut').onclick = () => inspectZoomCenter(0.8);
+$('btnInspectFit').onclick = inspectFit;
+$('btnInspect100').onclick = () => {
+  const rect = inspectSvg.getBoundingClientRect();
+  inspectZoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2,
+    1 / inspect.transform.scale);
+};
+function inspectZoomCenter(f) {
+  const rect = inspectSvg.getBoundingClientRect();
+  inspectZoomAt(rect.left + rect.width / 2, rect.top + rect.height / 2, f);
+}
+
+inspectSvg.addEventListener('wheel', (e) => {
+  if (!inspect.current) return;
+  e.preventDefault();
+  inspectZoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * 0.0015));
+}, { passive: false });
+
+inspectSvg.addEventListener('mousedown', (e) => {
+  if (!inspect.current || e.button !== 0) return;
+  if (e.target.dataset && e.target.dataset.code) return; // 点击区域：选中，不平移
+  inspect.drag = { startX: e.clientX, startY: e.clientY };
+  inspectSvg.classList.add('panning');
+});
+
+inspectSvg.addEventListener('mousemove', (e) => {
+  if (!inspect.current) return;
+  const pub = inspect.current.publication;
+  const rect = inspectSvg.getBoundingClientRect();
+  const t = inspect.transform;
+  const px = (e.clientX - rect.left - t.tx) / t.scale;
+  const py = (e.clientY - rect.top - t.ty) / t.scale;
+  $('inspectCursor').textContent =
+    (px >= 0 && py >= 0 && px <= pub.width && py <= pub.height)
+      ? `原图坐标 X:${Math.round(px)}, Y:${Math.round(py)}`
+      : '（光标在画布范围外）';
+  const drag = inspect.drag;
+  if (drag) {
+    t.tx += e.clientX - drag.startX;
+    t.ty += e.clientY - drag.startY;
+    drag.startX = e.clientX;
+    drag.startY = e.clientY;
+    applyInspectTransform();
+  }
+});
+
+window.addEventListener('mouseup', () => {
+  inspect.drag = null;
+  inspectSvg.classList.remove('panning');
+});
+
+window.addEventListener('resize', () => {
+  if (inspect.current) applyInspectTransform();
+});
 
 /* ------------------------------ 初始化 ------------------------------ */
 

@@ -120,6 +120,16 @@
       </div>
 
       <div class="panel-section">
+        <h3>巡检发布</h3>
+        <p id="pubStatus" class="muted">加载发布状态…</p>
+        <div class="btn-row" style="margin-top:8px">
+          <button class="btn primary" id="btnPublish">发布巡检版</button>
+          <button class="btn" id="btnViewInspect">查看巡检版</button>
+        </div>
+        <p class="hint">发布把当前图纸与全部区域冻结为只读快照；后续编辑、删区、换图不影响已发布内容。</p>
+      </div>
+
+      <div class="panel-section">
         <button class="btn wide" id="btnExport">⬇ 导出整图 JSON（含原图与全部区域）</button>
       </div>
     </aside>
@@ -144,6 +154,60 @@
         <span id="zoomLevel"></span>
       </div>
       <div id="conflictBanner" class="banner hidden"></div>
+    </div>
+  </main>
+
+  <!-- ============ 巡检版只读视图 ============ -->
+  <main id="view-inspect" class="view hidden">
+    <aside class="panel">
+      <div class="panel-section">
+        <button class="btn link" id="btnInspectBack">← 返回编辑</button>
+        <h2 id="inspectTitle">巡检版 <span class="muted sub">只读快照</span></h2>
+        <div class="meta-row">
+          <span id="inspectSeqBadge" class="badge"></span>
+          <span id="inspectPlanVer" class="badge"></span>
+          <span id="inspectLatestBadge" class="badge live hidden">当前最新</span>
+        </div>
+        <p class="muted" id="inspectMeta"></p>
+      </div>
+
+      <div class="panel-section">
+        <div class="toolbar">
+          <select id="inspectSeq" title="选择发布序号"></select>
+          <button class="btn" id="btnInspectLatest">最新版</button>
+        </div>
+        <div class="toolbar" style="margin-top:6px">
+          <button class="btn" id="btnInspectZoomIn">＋</button>
+          <button class="btn" id="btnInspectZoomOut">－</button>
+          <button class="btn" id="btnInspectFit">适应</button>
+          <button class="btn" id="btnInspect100">1:1</button>
+        </div>
+        <p class="hint">只读巡检视图：内容为发布时刻的快照，后续编辑、删区、换图均不影响。</p>
+      </div>
+
+      <div class="panel-section grow">
+        <h3>区域（只读）<span id="inspectRegionCount" class="muted"></span></h3>
+        <ul id="inspectRegionList" class="region-list"></ul>
+        <div id="inspectRegionDetail" class="inspect-detail hidden"></div>
+      </div>
+    </aside>
+
+    <div class="canvas-wrap">
+      <svg id="inspectSvg" xmlns="http://www.w3.org/2000/svg">
+        <g id="inspectViewport">
+          <rect id="inspectBg" x="0" y="0" fill="#ffffff"></rect>
+          <image id="inspectImage" x="0" y="0"></image>
+          <g id="inspectLayer"></g>
+        </g>
+      </svg>
+      <div id="inspectEmpty" class="inspect-empty hidden">
+        <p class="inspect-empty-title">暂无巡检版</p>
+        <p class="muted">该平面图还没有发布过巡检版。<br>请返回编辑页，点击「发布巡检版」生成只读快照。</p>
+      </div>
+      <div class="canvas-status">
+        <span id="inspectCursor"></span>
+        <span id="inspectZoom"></span>
+      </div>
     </div>
   </main>
 

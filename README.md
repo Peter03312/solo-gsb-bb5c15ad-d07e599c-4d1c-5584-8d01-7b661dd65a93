@@ -64,7 +64,7 @@ npm start
 运行测试：
 
 ```bash
-npm test            # 几何校验单元测试（17 项）
+npm test            # 几何校验单元测试（17 项）+ 巡检版发布/查询集成测试（14 项）
 ```
 
 ---
@@ -109,6 +109,10 @@ data/
    - 点击已有区域或左侧列表可选中编辑；保存 / 删除均带版本号。
 3. **导出整图 JSON**：单文件自包含（原图 base64 + 尺寸 + 区域 + 双方版本号），
    可在另一台机器导入恢复；同名平面图不会被覆盖，导入时可指定新名称。
+4. **发布巡检版**：编辑页左侧「巡检发布」区块点击**发布巡检版**，把当前图纸与全部
+   未删除区域冻结为只读快照；点击**查看巡检版**进入只读视图，可按发布序号切换
+   旧版 / 最新版（滚轮缩放、拖动平移，点击区域可查看其原图坐标）。
+   尚未发布时页面会明确提示「暂无巡检版」。
 
 多人协作：页面每 3 秒轮询一次最新数据。图纸与区域有任何变化都会收到提示，
 区域列表与图纸版本实时刷新；正在编辑的草稿不会被刷新覆盖。
@@ -153,6 +157,44 @@ data/
   **图片损坏或导入数据无效时，不会产生任何平面图、区域或半成品文件**。
 - 上传损坏 / 截断 / 伪装的 PNG、JPEG 同样在写库前被拒绝，不留垃圾记录。
 
+### 巡检版（只读发布快照）
+
+- **发布即冻结**：发布把发布时刻的原图（独立拷贝）与全部未删除区域的
+  **编号、风险等级、原图坐标**整体存入快照表；后续**编辑、删区、同尺寸换图**
+  均不回写快照，已发布内容永不变更。
+- **按发布序号查看**：每张图纸的巡检版从 #1 起递增，页面与 HTTP API 均可
+  按序号查看旧版，或用 `latest` 取最新版。
+- **版本一致性**：发布请求必须携带所见图纸版本 `plan_version`；期间图纸有改动
+  → **409 `PLAN_VERSION_CONFLICT`**，整个发布在单事务内完成，**不留下部分快照**。
+- **幂等**：同一图纸版本重复发布不会产生重复巡检版，返回 **200** 及已有巡检版
+  （`duplicate: true`）；数据库唯一索引 `(plan_id, plan_version)` 兜底。
+- **未发布**：查询最新版返回 **404 `NO_PUBLICATION`**（"暂无巡检版"），
+  页面巡检视图同样明确提示。
+- **原图缺失 / 保存失败**：发布时原图缺失 → **410 `IMAGE_MISSING`**；
+  快照写盘失败 → 事务回滚并清理残留文件。两种情况都**不会记为发布成功**。
+
+#### 调用示例（curl）
+
+```bash
+# 1) 发布：必须携带所见图纸版本（GET /api/plans/1 返回的 plan.version）
+curl -X POST http://localhost:8080/api/plans/1/publish \
+  -H 'Content-Type: application/json' \
+  -d '{"plan_version": 5}'
+# → 201 {"duplicate":false,"publication":{"seq":1,"plan_version":5,...},"regions":[...]}
+# 期间有改动 → 409 PLAN_VERSION_CONFLICT；同版本重复发布 → 200 duplicate:true
+
+# 2) 发布列表（空数组即暂无巡检版）
+curl http://localhost:8080/api/plans/1/publications
+
+# 3) 按发布序号查看旧版 / 最新版（含全部冻结区域）
+curl http://localhost:8080/api/plans/1/publications/1
+curl http://localhost:8080/api/plans/1/publications/latest
+
+# 4) 巡检版快照原图（发布时刻的独立拷贝，不受换图影响）
+curl -O http://localhost:8080/api/plans/1/publications/1/image
+curl -O http://localhost:8080/api/plans/1/publications/latest/image
+```
+
 ---
 
 ## 六、HTTP API 摘要
@@ -169,6 +211,10 @@ data/
 | `DELETE` | `/api/plans/:id/regions/:rid?version=&plan_version=` | 删除区域 |
 | `GET` | `/api/plans/:id/export` | 下载整图 JSON |
 | `POST` | `/api/import/file` | multipart 上传导出 JSON（可选 `name` 覆盖名称） |
+| `POST` | `/api/plans/:id/publish` | 发布巡检版（`plan_version` 必填；冲突 409，同版本重复发布幂等返回 200） |
+| `GET` | `/api/plans/:id/publications` | 巡检版列表（按发布序号升序，空数组即暂无巡检版） |
+| `GET` | `/api/plans/:id/publications/:seq` | 查看某一巡检版（`:seq` 为发布序号或 `latest`），含冻结区域 |
+| `GET` | `/api/plans/:id/publications/:seq/image` | 巡检版快照原图（`:seq` 同上） |
 
 顶点坐标格式：`vertices: [{"x": 120.5, "y": 88}, ...]`，均为**原图像素坐标**。
 错误响应统一为：`{"error":"CODE","message":"中文原因", ...}`，冲突/删除响应另带 `server` 最新快照。
@@ -191,11 +237,12 @@ data/
 ├── shared/
 │   └── geometry.js            # 自交/越界/重叠校验（前后端共用）
 ├── public/
-│   ├── index.html             # 单页界面（列表 + SVG 编辑器）
+│   ├── index.html             # 单页界面（列表 + SVG 编辑器 + 巡检版只读视图）
 │   ├── styles.css
-│   └── app.js                 # 缩放/平移/绘制/冲突保留/轮询协作
+│   └── app.js                 # 缩放/平移/绘制/冲突保留/轮询协作/发布与巡检查看
 └── tests/
-    └── geometry.test.js       # 几何规则单元测试
+    ├── geometry.test.js       # 几何规则单元测试
+    └── publish.test.js        # 巡检版发布/查询端到端集成测试
 ```
 
 ## 八、常见问题
