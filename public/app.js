@@ -15,6 +15,7 @@ const state = {
   plans: [],
   plan: null,
   regions: [],
+  publications: [],
   draft: null,            // {mode, id?, code, riskLevel, vertices, baseVersion?, closed}
   transform: { scale: 1, tx: 0, ty: 0 },
   pointer: null,          // 绘制时鼠标悬停的原图坐标
@@ -80,7 +81,15 @@ async function loadPlans() {
   const tbody = $('planList');
   tbody.innerHTML = '';
   $('emptyHint').classList.toggle('hidden', state.plans.length > 0);
-  for (const p of state.plans) {
+  // 并发取每张图纸的巡检版概况（图纸数量少；用于列表显示最新发布序号）
+  const pubInfos = await Promise.all(state.plans.map(async (p) => {
+    try {
+      const d = await api('GET', `/api/plans/${p.id}/publications`);
+      return { count: d.count, latest: d.latest_seq };
+    } catch (_) { return { count: 0, latest: null }; }
+  }));
+  for (const [i, p] of state.plans.entries()) {
+    const pubInfo = pubInfos[i];
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>${p.id}</td>
@@ -88,6 +97,9 @@ async function loadPlans() {
       <td>${p.width} × ${p.height}</td>
       <td>${p.region_count}</td>
       <td>v${p.version}</td>
+      <td>${pubInfo.count
+        ? `<a href="/inspector.html?plan=${p.id}" target="_blank" rel="noopener">第 ${pubInfo.latest} 号（共 ${pubInfo.count}）</a>`
+        : '<span class="muted">暂无巡检版</span>'}</td>
       <td class="muted">${esc(p.updated_at || '')}</td>
       <td class="actions"></td>`;
     const td = tr.querySelector('.actions');
@@ -95,12 +107,19 @@ async function loadPlans() {
     openBtn.className = 'btn primary';
     openBtn.textContent = '打开';
     openBtn.onclick = () => openPlan(p.id);
+    const inspBtn = document.createElement('button');
+    inspBtn.className = 'btn';
+    inspBtn.textContent = '巡检';
+    inspBtn.style.marginLeft = '6px';
+    inspBtn.disabled = pubInfo.count === 0;
+    inspBtn.title = pubInfo.count ? '打开只读巡检页（最新版）' : '暂无巡检版，请先在图纸内发布';
+    inspBtn.onclick = () => { window.open(`/inspector.html?plan=${p.id}`, '_blank', 'noopener'); };
     const expBtn = document.createElement('button');
     expBtn.className = 'btn';
     expBtn.textContent = '导出';
     expBtn.style.marginLeft = '6px';
     expBtn.onclick = () => { window.location.href = `/api/plans/${p.id}/export`; };
-    td.append(openBtn, expBtn);
+    td.append(openBtn, inspBtn, expBtn);
     tbody.appendChild(tr);
   }
 }
@@ -182,6 +201,7 @@ async function openPlan(id) {
   renderDraft();
   updateForm();
   fitView();
+  loadPublications();
   startPolling();
 }
 
@@ -197,7 +217,99 @@ $('btnExport').addEventListener('click', () => {
 
 function updatePlanVersionBadge() {
   $('planVersion').textContent = `图纸版本 v${state.plan.version}`;
+  const pv = $('pubCurrentVersion');
+  if (pv) pv.textContent = state.plan ? state.plan.version : '–';
 }
+
+/* --------------------------- 只读巡检版：发布 / 列表 --------------------------- */
+
+async function loadPublications() {
+  if (!state.plan) return;
+  let data;
+  try {
+    data = await api('GET', `/api/plans/${state.plan.id}/publications`);
+  } catch (err) {
+    toast('巡检版列表加载失败：' + err.message, 'err');
+    return;
+  }
+  state.publications = data.publications;
+  renderPublications(data);
+}
+
+function renderPublications(data) {
+  const ul = $('pubList');
+  const emptyHint = $('pubEmptyHint');
+  const inspLink = $('btnInspector');
+  ul.innerHTML = '';
+  emptyHint.classList.toggle('hidden', data.count > 0);
+  emptyHint.textContent = data.count
+    ? '' : '暂无巡检版——发布后巡检人员即可通过只读链接查看';
+  inspLink.classList.toggle('btn-disabled-link', data.count === 0);
+  inspLink.href = `/inspector.html?plan=${state.plan.id}`;
+
+  for (const p of data.publications) {
+    const li = document.createElement('li');
+    const isLatest = p.seq === data.latest_seq;
+    li.innerHTML = `
+      <span class="pub-seq">#${p.seq}${isLatest ? ' · 最新' : ''}</span>
+      <span>
+        图纸 v${p.plan_version} · ${p.region_count} 区
+        <span class="pub-meta">${esc(p.published_at || '')}</span>
+      </span>
+      <span class="pub-actions"></span>`;
+    const actions = li.querySelector('.pub-actions');
+    const viewBtn = document.createElement('a');
+    viewBtn.className = 'btn';
+    viewBtn.textContent = '查看';
+    viewBtn.href = `/inspector.html?plan=${state.plan.id}&seq=${p.seq}`;
+    viewBtn.target = '_blank';
+    viewBtn.rel = 'noopener';
+    const apiBtn = document.createElement('a');
+    apiBtn.className = 'btn';
+    apiBtn.textContent = 'API';
+    apiBtn.href = `/api/plans/${state.plan.id}/publications/${p.seq}`;
+    apiBtn.target = '_blank';
+    apiBtn.rel = 'noopener';
+    actions.append(viewBtn, apiBtn);
+    ul.appendChild(li);
+  }
+}
+
+$('btnPublish').addEventListener('click', async () => {
+  if (!state.plan) return;
+  const btn = $('btnPublish');
+  btn.disabled = true;
+  try {
+    const res = await api('POST', `/api/plans/${state.plan.id}/publications`, {
+      plan_version: state.plan.version,
+    });
+    if (res.reused) {
+      toast(res.message || `当前图纸版本 v${state.plan.version} 已发布过，未重复创建巡检版`, 'info', 5000);
+    } else {
+      toast(res.message || '巡检版已发布（只读快照）', 'ok', 5000);
+    }
+    await loadPublications();
+  } catch (err) {
+    if (err.status === 409 && err.code === 'PLAN_VERSION_CONFLICT') {
+      // 发布期间图纸被改动：服务端未留下任何快照；刷新到最新版本后由用户确认重发
+      const snap = err.data && err.data.server;
+      if (snap && snap.plan_version) {
+        state.plan.version = snap.plan_version;
+        state.regions = snap.regions || state.regions;
+        updatePlanVersionBadge();
+        renderRegions();
+        renderRegionList();
+      }
+      toast(`发布被拒绝（版本冲突，未产生快照）：${err.message}`, 'err', 7000);
+    } else if (err.status === 410 && err.code === 'IMAGE_MISSING') {
+      toast(`无法发布：${err.message}`, 'err', 7000);
+    } else {
+      toast(`发布失败：${err.message}`, 'err', 7000);
+    }
+  } finally {
+    btn.disabled = false;
+  }
+});
 
 /* ----------------------------- 坐标 / 视口 ----------------------------- */
 
@@ -832,6 +944,7 @@ function startPolling() {
         renderRegions();
         renderRegionList();
         runLiveValidate();
+        loadPublications().catch(() => {});
         if (!first && state.draft) {
           const badge = $('collabHint');
           badge.classList.remove('hidden');

@@ -12,6 +12,7 @@ const config = require('./config');
 function openDb() {
   fs.mkdirSync(config.dataDir, { recursive: true });
   fs.mkdirSync(config.uploadDir(), { recursive: true });
+  fs.mkdirSync(config.snapshotDir(), { recursive: true });
 
   const db = new Database(config.dbFile());
   db.pragma('journal_mode = WAL');
@@ -48,6 +49,30 @@ function openDb() {
 
     CREATE INDEX IF NOT EXISTS idx_regions_plan
       ON regions(plan_id, deleted);
+
+    -- 只读巡检版：一次发布即冻结原图快照与全部未删除区域，后续编辑不可改变
+    CREATE TABLE IF NOT EXISTS publications (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      plan_id         INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
+      seq             INTEGER NOT NULL,          -- 图纸内发布序号，从 1 递增
+      plan_version    INTEGER NOT NULL,          -- 发布时所见图纸版本（乐观锁依据）
+      plan_name       TEXT    NOT NULL,          -- 冻结当时的图纸名称
+      width           INTEGER NOT NULL,
+      height          INTEGER NOT NULL,
+      image_file      TEXT    NOT NULL,          -- data/snapshots 下的独立原图副本，不随换图变化
+      image_mime      TEXT    NOT NULL,
+      regions_json    TEXT    NOT NULL,          -- 冻结区域：[{code,risk_level,vertices}]
+      region_count    INTEGER NOT NULL DEFAULT 0,
+      published_at    TEXT    NOT NULL DEFAULT (datetime('now'))
+    );
+
+    -- 同一图纸版本重复发布幂等：不产生第二条巡检版
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_publications_plan_version
+      ON publications(plan_id, plan_version);
+
+    -- 序号在图纸内唯一（并用 seq DESC 取最新版）
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_publications_plan_seq
+      ON publications(plan_id, seq);
   `);
 
   return db;

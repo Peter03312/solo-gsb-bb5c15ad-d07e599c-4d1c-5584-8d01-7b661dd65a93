@@ -19,6 +19,8 @@ const config = {
 
 config.dbFile = () => path.join(config.dataDir, 'annotator.db');
 config.uploadDir = () => path.join(config.dataDir, 'uploads');
+// 巡检版冻结的原图副本目录，与编辑用 uploads 隔离，换图不会覆盖已发布快照
+config.snapshotDir = () => path.join(config.dataDir, 'snapshots');
 config.maxUploadBytes = () => config.maxUploadMb * 1024 * 1024;
 // 导出 JSON 含 base64 图片，约为原图 4/3 倍，留足余量
 config.maxImportBytes = () => (config.maxUploadMb + 16) * 1024 * 1024;

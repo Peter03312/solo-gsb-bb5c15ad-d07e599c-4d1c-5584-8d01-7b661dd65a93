@@ -51,7 +51,7 @@
       <h2>已有的平面图</h2>
       <table class="plan-table">
         <thead>
-          <tr><th>ID</th><th>名称</th><th>尺寸(px)</th><th>区域数</th><th>版本</th><th>更新时间</th><th>操作</th></tr>
+          <tr><th>ID</th><th>名称</th><th>尺寸(px)</th><th>区域数</th><th>版本</th><th>巡检版</th><th>更新时间</th><th>操作</th></tr>
         </thead>
         <tbody id="planList"></tbody>
       </table>
@@ -117,6 +117,17 @@
       <div class="panel-section grow">
         <h3>区域列表 <span id="regionCount" class="muted"></span></h3>
         <ul id="regionList" class="region-list"></ul>
+      </div>
+
+      <div class="panel-section">
+        <h3>只读巡检版</h3>
+        <p class="hint">发布即冻结当前所见版本（v<span id="pubCurrentVersion">–</span>）的原图与全部区域的编号、风险等级、原图坐标；后续编辑、删区、同尺寸换图都不影响已发布内容。</p>
+        <div class="pub-btn-row" style="margin-top:8px">
+          <button class="btn primary" id="btnPublish">🔒 发布巡检版</button>
+          <a class="btn" id="btnInspector" href="#" target="_blank" rel="noopener">打开巡检页</a>
+        </div>
+        <p class="pub-empty" id="pubEmptyHint">暂无巡检版</p>
+        <ul class="pub-list" id="pubList"></ul>
       </div>
 
       <div class="panel-section">

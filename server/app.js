@@ -159,6 +159,24 @@ function storeImageFile(id, buf, mime) {
   return path.basename(finalPath);
 }
 
+/**
+ * 巡检版冻结原图：写入独立的 snapshots 目录，文件名带发布记录 id，
+ * 与编辑用 uploads/<planId>.* 完全隔离 —— 后续同尺寸换图不会覆盖已发布内容。
+ */
+function storeSnapshotFile(publicationId, buf, mime) {
+  const finalPath = path.join(config.snapshotDir(), `${publicationId}${extOf(mime)}`);
+  const tmpPath = path.join(config.snapshotDir(),
+    `.tmp-${process.pid}-pub-${publicationId}-${Date.now()}${extOf(mime)}`);
+  try {
+    fs.writeFileSync(tmpPath, buf);
+    fs.renameSync(tmpPath, finalPath);
+  } catch (e) {
+    try { fs.existsSync(tmpPath) && fs.unlinkSync(tmpPath); } catch (_) {}
+    throw e;
+  }
+  return path.basename(finalPath);
+}
+
 /* ----------------------------- multer 上传 ----------------------------- */
 
 const imageUpload = multer({
@@ -686,6 +704,257 @@ app.post('/api/import/file', uploader(importUpload, 'file'), wrap((req, res) => 
   });
 }));
 
+/* --------------------------- 只读巡检版（发布 / 查看） --------------------------- */
+
+function publicationJson(pub, includeRegions = true) {
+  const out = {
+    id: pub.id,
+    plan_id: pub.plan_id,
+    seq: pub.seq,
+    plan_version: pub.plan_version,
+    plan_name: pub.plan_name,
+    width: pub.width,
+    height: pub.height,
+    image_mime: pub.image_mime,
+    region_count: pub.region_count,
+    published_at: pub.published_at,
+  };
+  if (includeRegions) out.regions = JSON.parse(pub.regions_json);
+  return out;
+}
+
+/** 按图纸内发布序号取发布记录（latest 由调用方先解析为具体 seq） */
+function getPublication(plan, seq) {
+  const pub = db.prepare('SELECT * FROM publications WHERE plan_id = ? AND seq = ?')
+    .get(plan.id, seq);
+  if (!pub) {
+    throw new ApiError(404, 'NO_PUBLICATION',
+      `图纸「${plan.name}」暂无第 ${seq} 号巡检版（可能从未发布或序号超出范围）`);
+  }
+  return pub;
+}
+
+function requirePlanVersionForPublish(body, plan) {
+  if (body.plan_version == null) {
+    throw new ApiError(400, 'VALIDATION_ERROR',
+      '发布请求必须携带所见图纸版本 plan_version（正整数）');
+  }
+  const pv = Number(body.plan_version);
+  if (!Number.isInteger(pv) || pv < 1) {
+    throw new ApiError(400, 'VALIDATION_ERROR', 'plan_version 必须为正整数');
+  }
+  if (pv !== plan.version) {
+    throw new ApiError(409, 'PLAN_VERSION_CONFLICT',
+      `图纸在你查看后已被修改（你的所见版本 v${pv}，当前版本 v${plan.version}），` +
+      `本次发布已中止且未留下任何快照，请刷新确认后用最新版本重新发布。`,
+      { server: serverSnapshot(plan) });
+  }
+  return pv;
+}
+
+/**
+ * 发布只读巡检版。
+ * 语义：
+ *  - 必须携带所见 plan_version；与当前不一致 → 409，不写任何快照文件/记录；
+ *  - 原图缺失或快照保存失败 → 4xx/5xx，不记为发布成功；
+ *  - 同一 plan_version 重复发布 → 幂等返回已存在的巡检版（200, reused=true），不产生重复版本；
+ *  - 冻结内容：原图副本 + 当时全部未删除区域的编号、风险等级、原图坐标。
+ */
+app.post('/api/plans/:id/publications', wrap((req, res) => {
+  const plan = getPlanOr404(req.params.id);
+  const pv = requirePlanVersionForPublish(req.body || {}, plan);
+
+  // 幂等：同一图纸版本已发布过，直接返回原巡检版，绝不重复创建
+  const existing = db.prepare('SELECT * FROM publications WHERE plan_id = ? AND plan_version = ?')
+    .get(plan.id, pv);
+  if (existing) {
+    return res.json({
+      publication: publicationJson(existing),
+      reused: true,
+      message: `图纸版本 v${pv} 已发布过（第 ${existing.seq} 号巡检版），未重复创建`,
+    });
+  }
+
+  // 原图必须存在且可读；发布后巡检者看到的是独立副本
+  const srcFile = path.join(config.uploadDir(), plan.image_file);
+  if (!plan.image_file || !fs.existsSync(srcFile)) {
+    throw new ApiError(410, 'IMAGE_MISSING',
+      '原图文件在数据目录中缺失，无法发布巡检版；请先重新上传同尺寸原图');
+  }
+  let imageBuf;
+  try {
+    imageBuf = fs.readFileSync(srcFile);
+  } catch (e) {
+    throw new ApiError(500, 'IMAGE_UNREADABLE', `原图读取失败，发布已中止：${e.message}`);
+  }
+  try {
+    const dims = readImageSize(imageBuf, plan.image_mime);
+    if (dims.mime !== plan.image_mime || dims.width !== plan.width || dims.height !== plan.height) {
+      throw new ApiError(500, 'IMAGE_CORRUPT',
+        '磁盘上的原图与图纸记录不一致（类型/尺寸），为避免发布损坏快照已中止，请重新上传原图');
+    }
+  } catch (e) {
+    if (e instanceof ApiError) throw e;
+    throw new ApiError(500, 'IMAGE_CORRUPT', `原图已损坏或无法解析，发布已中止：${e.message}`);
+  }
+
+  // 冻结区域：仅取未删除区域的编号、风险等级、原图坐标（顶点 JSON 已规范化）
+  const frozenRegions = activeRegions(plan.id).map((r) => ({
+    code: r.code,
+    risk_level: r.risk_level,
+    vertices: r.vertices,
+  }));
+
+  let publicationId = null;
+  let snapshotName = null;
+  let racedDup = null;
+  try {
+    const result = db.transaction(() => {
+      // 事务内二次确认版本，挡住检查之后、写入之前的并发改动
+      const fresh = db.prepare('SELECT version FROM plans WHERE id = ?').get(plan.id);
+      if (!fresh || fresh.version !== pv) {
+        throw new ApiError(409, 'PLAN_VERSION_CONFLICT',
+          `图纸在发布期间被修改（所见版本 v${pv}，当前版本 v${fresh ? fresh.version : '?'}），` +
+          `本次发布已中止且未留下任何快照。`,
+          { server: fresh ? serverSnapshot(getPlanOr404(plan.id)) : null });
+      }
+      const dup = db.prepare('SELECT * FROM publications WHERE plan_id = ? AND plan_version = ?')
+        .get(plan.id, pv);
+      if (dup) return { dup };
+
+      const nextSeq = (db.prepare('SELECT COALESCE(MAX(seq), 0) + 1 AS s FROM publications WHERE plan_id = ?')
+        .get(plan.id)).s;
+      const info = db.prepare(`
+        INSERT INTO publications
+          (plan_id, seq, plan_version, plan_name, width, height, image_file, image_mime,
+           regions_json, region_count)
+        VALUES (@plan_id, @seq, @plan_version, @plan_name, @w, @h, '', @mime, @regions, @count)
+      `).run({
+        plan_id: plan.id, seq: nextSeq, plan_version: pv, plan_name: plan.name,
+        w: plan.width, h: plan.height, mime: plan.image_mime,
+        regions: JSON.stringify(frozenRegions), count: frozenRegions.length,
+      });
+      // 快照文件落盘失败（磁盘满/目录不可写）则整个事务回滚，不留半成品记录
+      try {
+        snapshotName = storeSnapshotFile(info.lastInsertRowid, imageBuf, plan.image_mime);
+      } catch (storeErr) {
+        throw new ApiError(500, 'SNAPSHOT_SAVE_FAILED',
+          `巡检版快照原图保存失败，发布已中止且未记录为成功：${storeErr.message}。请检查数据目录磁盘空间与权限后重试。`);
+      }
+      db.prepare('UPDATE publications SET image_file = ? WHERE id = ?')
+        .run(snapshotName, info.lastInsertRowid);
+      return { id: info.lastInsertRowid };
+    })();
+
+    if (result.dup) {
+      return res.json({
+        publication: publicationJson(result.dup),
+        reused: true,
+        message: `图纸版本 v${pv} 已发布过（第 ${result.dup.seq} 号巡检版），未重复创建`,
+      });
+    }
+    publicationId = result.id;
+  } catch (e) {
+    // 并发竞态：两个同版本请求同时通过前置检查，唯一索引挡住第二个。
+    // 此时对方已成功发布同一版本 → 按幂等返回其巡检版，而非 500。
+    if (e && (e.code === 'SQLITE_CONSTRAINT_UNIQUE' ||
+              (e.message && /UNIQUE constraint failed/i.test(e.message)))) {
+      const winner = db.prepare('SELECT * FROM publications WHERE plan_id = ? AND plan_version = ?')
+        .get(plan.id, pv);
+      if (winner) racedDup = winner;
+    }
+    if (!racedDup) {
+      // 事务已回滚；防御性清理可能残留的孤儿快照文件
+      if (publicationId) {
+        const f = path.join(config.snapshotDir(), `${publicationId}${extOf(plan.image_mime)}`);
+        if (fs.existsSync(f)) { try { fs.unlinkSync(f); } catch (_) {} }
+      }
+      throw e;
+    }
+  }
+
+  if (racedDup) {
+    return res.json({
+      publication: publicationJson(racedDup),
+      reused: true,
+      message: `图纸版本 v${pv} 已发布过（第 ${racedDup.seq} 号巡检版），未重复创建`,
+    });
+  }
+
+  const pub = db.prepare('SELECT * FROM publications WHERE id = ?').get(publicationId);
+  res.status(201).json({
+    publication: publicationJson(pub),
+    reused: false,
+    message: `已发布第 ${pub.seq} 号巡检版（基于图纸 v${pv}，含 ${pub.region_count} 个区域）`,
+  });
+}));
+
+// 巡检版列表（含最新版序号）；从未发布时返回空数组，由调用方明确提示「暂无巡检版」
+app.get('/api/plans/:id/publications', wrap((req, res) => {
+  const plan = getPlanOr404(req.params.id);
+  const rows = db.prepare(`
+    SELECT * FROM publications WHERE plan_id = ? ORDER BY seq DESC
+  `).all(plan.id);
+  res.json({
+    plan_id: plan.id,
+    plan_name: plan.name,
+    latest_seq: rows.length ? rows[0].seq : null,
+    count: rows.length,
+    publications: rows.map((p) => publicationJson(p, false)),
+  });
+}));
+
+// 取最新巡检版；从未发布 → 404 NO_PUBLICATION（页面与 API 均据此提示「暂无巡检版」）
+app.get('/api/plans/:id/publications/latest', wrap((req, res) => {
+  const plan = getPlanOr404(req.params.id);
+  const pub = db.prepare('SELECT * FROM publications WHERE plan_id = ? ORDER BY seq DESC LIMIT 1')
+    .get(plan.id);
+  if (!pub) {
+    throw new ApiError(404, 'NO_PUBLICATION', `图纸「${plan.name}」暂无巡检版，尚未发布过`);
+  }
+  res.json({ publication: publicationJson(pub) });
+}));
+
+// 按发布序号查看旧版巡检版（只读快照）
+app.get('/api/plans/:id/publications/:seq', wrap((req, res) => {
+  const plan = getPlanOr404(req.params.id);
+  const seq = Number(req.params.seq);
+  if (!Number.isInteger(seq) || seq < 1) {
+    throw new ApiError(400, 'VALIDATION_ERROR', '发布序号 seq 必须为正整数');
+  }
+  const pub = getPublication(plan, seq);
+  res.json({ publication: publicationJson(pub) });
+}));
+
+// 巡检版冻结原图：永远读 snapshots 下的副本，与编辑中的原图互不影响
+app.get('/api/plans/:id/publications/:seq/image', wrap((req, res) => {
+  const plan = getPlanOr404(req.params.id);
+  let seq;
+  if (req.params.seq === 'latest') {
+    const latest = db.prepare('SELECT seq FROM publications WHERE plan_id = ? ORDER BY seq DESC LIMIT 1')
+      .get(plan.id);
+    if (!latest) {
+      throw new ApiError(404, 'NO_PUBLICATION', `图纸「${plan.name}」暂无巡检版，尚未发布过`);
+    }
+    seq = latest.seq;
+  } else {
+    seq = Number(req.params.seq);
+    if (!Number.isInteger(seq) || seq < 1) {
+      throw new ApiError(400, 'VALIDATION_ERROR', '发布序号 seq 必须为正整数或 latest');
+    }
+  }
+  const pub = getPublication(plan, seq);
+  const file = path.join(config.snapshotDir(), pub.image_file);
+  if (!pub.image_file || !fs.existsSync(file)) {
+    throw new ApiError(410, 'IMAGE_MISSING', `第 ${seq} 号巡检版的冻结原图缺失`);
+  }
+  res.setHeader('Cache-Control', 'private, max-age=86400, immutable');
+  res.setHeader('Content-Type', pub.image_mime);
+  fs.createReadStream(file).on('error', () => {
+    if (!res.headersSent) res.status(500).json({ error: 'INTERNAL', message: '读取巡检版图片失败' });
+  }).pipe(res);
+}));
+
 /* ------------------------------- 错误处理 ------------------------------- */
 
 app.use((err, req, res, next) => { // eslint-disable-line no-unused-vars
@@ -711,3 +980,4 @@ process.on('SIGTERM', () => server.close(() => db.close()));
 process.on('SIGINT', () => server.close(() => db.close()));
 
 module.exports = app;
+module.exports.server = server;
